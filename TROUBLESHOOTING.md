@@ -4,19 +4,26 @@
 
 1. **Check plugin is loaded:**
    - Verify `load_plugins` is configured in your `config.kdl`
-   - Check Zellij logs: `tail -f /tmp/zellij-*/zellij-log-*/zellij.log` (look for `zellij-attention: loaded`)
+   - Check Zellij logs for `zellij-attention: v… loaded` (log dir is OS-specific):
+     - Linux: `tail -f /tmp/zellij-*/zellij-log/zellij.log`
+     - macOS: `tail -f $TMPDIR/zellij-*/zellij-log/zellij.log`
 
 2. **Verify pipe commands work:**
    ```bash
    echo $ZELLIJ_PANE_ID  # Should print a number
-   zellij pipe --name "zellij-attention::waiting::$ZELLIJ_PANE_ID"
+   zellij pipe --name "zellij-attention::working::$ZELLIJ_PANE_ID"
    # Tab name should change immediately
    ```
+   > **Nushell:** `$ZELLIJ_PANE_ID` is *not* expanded inside `"…"`. Use string
+   > interpolation: `zellij pipe --name $"zellij-attention::working::($env.ZELLIJ_PANE_ID)"`.
 
-3. **Clear Zellij plugin cache:**
+3. **Clear the compiled-plugin cache** (then start a fresh session — `load_plugins` loads at session start):
    ```bash
-   # Zellij caches compiled WASM — clear if the plugin isn't updating
-   find ~/.cache/zellij -path "*zellij-attention*" -exec rm -f {} \;
+   # Zellij caches compiled WASM by path; clear if the plugin isn't updating.
+   # Linux:
+   find ~/.cache/zellij -path "*zellij-attention*" -delete
+   # macOS:
+   find ~/Library/Caches/org.Zellij-Contributors.Zellij -path "*zellij-attention*" -delete
    ```
 
 ## Plugin not loading
@@ -34,19 +41,19 @@
 
 **Correct:**
 ```bash
-zellij pipe --name "zellij-attention::waiting::5"
+zellij pipe --name "zellij-attention::working::5"
 ```
 
 **Common mistakes:**
 ```bash
 # WRONG: Single colon
-zellij pipe --name "zellij-attention:waiting:5"
+zellij pipe --name "zellij-attention:working:5"
 
 # WRONG: Missing plugin name prefix
-zellij pipe --name "waiting::5"
+zellij pipe --name "working::5"
 
 # WRONG: Using --plugin instead of --name
-zellij pipe --plugin "zellij-attention" --message "waiting::5"
+zellij pipe --plugin "zellij-attention" --message "working::5"
 ```
 
 ## Tabs not restoring original names

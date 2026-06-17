@@ -3422,10 +3422,8 @@ dependencies = [
 
 [[package]]
 name = "zellij-attention"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
- "serde",
- "serde_json",
  "zellij-tile",
 ]
 

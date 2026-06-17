@@ -16,7 +16,7 @@ pub struct State {
     permissions_granted: bool,
     pub(crate) tabs: Vec<TabInfo>,
     pub(crate) panes: PaneManifest,
-    pub(crate) notification_state: HashMap<u32, HashSet<NotificationType>>,
+    pub(crate) notification_state: HashMap<u32, NotificationType>,
     /// Maps pane_id → tab name (stripped) at the time the notification was set.
     /// Used to verify pane-to-tab mapping during reorders.
     pub(crate) notified_tab_names: HashMap<u32, String>,
@@ -28,21 +28,47 @@ pub struct State {
 }
 
 impl State {
+    /// Records `notification` for `pane_id` and remembers the pane's tab (used for
+    /// reorder verification). A `done` marker that lands on the already-focused pane is
+    /// treated as pre-acknowledged and dropped before any icon is painted — the
+    /// set-while-focused half of the clearing fix.
+    pub(crate) fn set_pane_notification(&mut self, pane_id: u32, notification: NotificationType) {
+        self.notification_state.insert(pane_id, notification);
+        if let Some(tab_name) = self.find_tab_name_for_pane(pane_id) {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "zellij-attention: Notification {:?} for pane {} in tab '{}'",
+                notification, pane_id, tab_name
+            );
+            self.notified_tab_names.insert(pane_id, tab_name);
+        }
+        if notification == NotificationType::Done && self.determine_focused_pane() == Some(pane_id)
+        {
+            self.notification_state.remove(&pane_id);
+            self.notified_tab_names.remove(&pane_id);
+        }
+    }
+
+    /// Removes any notification for `pane_id` (the `clear` pipe verb / `SessionEnd`).
+    pub(crate) fn clear_pane_notification(&mut self, pane_id: u32) {
+        self.notification_state.remove(&pane_id);
+        self.notified_tab_names.remove(&pane_id);
+    }
+
     fn determine_focused_pane(&self) -> Option<u32> {
         let active_tab = self.tabs.iter().find(|t| t.active)?;
         let panes = self.panes.panes.get(&active_tab.position)?;
         let focused = panes.iter().find(|p| {
-            !p.is_plugin
-                && p.is_focused
-                && (p.is_floating == active_tab.are_floating_panes_visible)
+            !p.is_plugin && p.is_focused && (p.is_floating == active_tab.are_floating_panes_visible)
         })?;
         Some(focused.id)
     }
 
-    /// Checks if focused pane has notifications and clears them.
-    /// Only clears if the active tab's name shows our notification icon,
-    /// preventing false clears during tab reorders when pane/tab data is out of sync.
-    /// Returns true if any notification was cleared.
+    /// Clears a `done` marker on the focused pane. Attention/working are live status
+    /// and persist regardless of focus, so they are left untouched.
+    /// Only acts if the active tab's name shows one of our icons, preventing false
+    /// clears during tab reorders when pane/tab data is out of sync.
+    /// Returns true if a marker was cleared.
     pub(crate) fn check_and_clear_focus(&mut self) -> bool {
         if self.config.enabled {
             let active_tab = self.tabs.iter().find(|t| t.active);
@@ -53,11 +79,13 @@ impl State {
             }
         }
         if let Some(focused_pane_id) = self.determine_focused_pane() {
-            if self.notification_state.remove(&focused_pane_id).is_some() {
+            // `done` is the only focus-clearable state.
+            if self.notification_state.get(&focused_pane_id) == Some(&NotificationType::Done) {
+                self.notification_state.remove(&focused_pane_id);
                 self.notified_tab_names.remove(&focused_pane_id);
                 #[cfg(debug_assertions)]
                 eprintln!(
-                    "zellij-attention: Cleared notifications for focused pane {}",
+                    "zellij-attention: Cleared done marker for focused pane {}",
                     focused_pane_id
                 );
                 return true;
@@ -106,15 +134,23 @@ impl State {
 
     /// Checks if a tab name ends with one of our notification icon suffixes.
     pub(crate) fn tab_name_has_icon(&self, name: &str) -> bool {
-        let waiting_suffix = format!(" {}", self.config.waiting_icon);
-        let completed_suffix = format!(" {}", self.config.completed_icon);
-        name.ends_with(&waiting_suffix) || name.ends_with(&completed_suffix)
+        [
+            &self.config.attention_icon,
+            &self.config.working_icon,
+            &self.config.done_icon,
+        ]
+        .iter()
+        .any(|icon| name.ends_with(&format!(" {}", icon)))
     }
 
     /// Strips notification icon suffixes from a tab name.
     pub(crate) fn strip_icons(&self, name: &str) -> String {
         let mut result = name.to_string();
-        for icon in [&self.config.waiting_icon, &self.config.completed_icon] {
+        for icon in [
+            &self.config.attention_icon,
+            &self.config.working_icon,
+            &self.config.done_icon,
+        ] {
             let suffix = format!(" {}", icon);
             while result.ends_with(&suffix) {
                 result.truncate(result.len() - suffix.len());
@@ -140,17 +176,20 @@ impl State {
         None
     }
 
-    pub(crate) fn get_tab_notification_state(&self, tab_position: usize) -> Option<NotificationType> {
+    pub(crate) fn get_tab_notification_state(
+        &self,
+        tab_position: usize,
+    ) -> Option<NotificationType> {
         let tab = self.tabs.iter().find(|t| t.position == tab_position);
         let tab_base_name = tab.map(|t| self.strip_icons(&t.name));
         let panes = self.panes.panes.get(&tab_position)?;
-        let mut has_completed = false;
+        let mut best: Option<NotificationType> = None;
 
         for pane in panes {
             if pane.is_plugin {
                 continue;
             }
-            if let Some(notifications) = self.notification_state.get(&pane.id) {
+            if let Some(&notification) = self.notification_state.get(&pane.id) {
                 // Verify this pane actually belongs to this tab (not a stale mapping)
                 if let Some(expected_name) = self.notified_tab_names.get(&pane.id) {
                     if let Some(ref actual_name) = tab_base_name {
@@ -164,20 +203,14 @@ impl State {
                         }
                     }
                 }
-                if notifications.contains(&NotificationType::Waiting) {
-                    return Some(NotificationType::Waiting);
-                }
-                if notifications.contains(&NotificationType::Completed) {
-                    has_completed = true;
+                // The tab shows the highest-priority state across its Claude panes.
+                if best.is_none_or(|b| notification.priority() > b.priority()) {
+                    best = Some(notification);
                 }
             }
         }
 
-        if has_completed {
-            Some(NotificationType::Completed)
-        } else {
-            None
-        }
+        best
     }
 
     /// Updates tab names to show notification icons or strip stale ones.
@@ -221,8 +254,9 @@ impl State {
 
             if let Some(notification) = self.get_tab_notification_state(tab.position) {
                 let icon = match notification {
-                    NotificationType::Waiting => &self.config.waiting_icon,
-                    NotificationType::Completed => &self.config.completed_icon,
+                    NotificationType::Attention => &self.config.attention_icon,
+                    NotificationType::Working => &self.config.working_icon,
+                    NotificationType::Done => &self.config.done_icon,
                 };
                 let new_name = format!("{} {}", base_name, icon);
 
@@ -245,7 +279,11 @@ impl State {
             } else if self.tab_name_has_icon(&tab.name) {
                 // Check if any active notification expects a tab with this name.
                 // If so, the icon isn't stale — the tab just moved to a new position.
-                if self.notified_tab_names.values().any(|name| name == &base_name) {
+                if self
+                    .notified_tab_names
+                    .values()
+                    .any(|name| name == &base_name)
+                {
                     continue;
                 }
                 // Truly stale icon — strip it
@@ -262,7 +300,8 @@ impl State {
         // Clean up pending_renames for tabs that no longer exist
         if !self.tabs.is_empty() {
             let valid_positions: HashSet<usize> = self.tabs.iter().map(|t| t.position).collect();
-            self.pending_renames.retain(|pos| valid_positions.contains(pos));
+            self.pending_renames
+                .retain(|pos| valid_positions.contains(pos));
         }
 
         self.updating_tabs = false;
@@ -352,14 +391,18 @@ impl ZellijPlugin for State {
             };
             (event_type, pane_id)
         } else {
-            eprintln!("zellij-attention: Invalid format. Use: zellij-attention::EVENT_TYPE::PANE_ID\n");
+            eprintln!(
+                "zellij-attention: Invalid format. Use: zellij-attention::EVENT_TYPE::PANE_ID\n"
+            );
             unblock_cli_pipe_input(&pipe_message.name);
             return false;
         };
 
-        let notification_type = match event_type.to_lowercase().as_str() {
-            "waiting" => NotificationType::Waiting,
-            "completed" => NotificationType::Completed,
+        let notification = match event_type.to_lowercase().as_str() {
+            "attention" => Some(NotificationType::Attention),
+            "working" => Some(NotificationType::Working),
+            "done" => Some(NotificationType::Done),
+            "clear" => None,
             unknown => {
                 eprintln!("zellij-attention: Unknown event type: {}\n", unknown);
                 unblock_cli_pipe_input(&pipe_message.name);
@@ -371,15 +414,9 @@ impl ZellijPlugin for State {
         // regardless of what happens during state mutation or tab renaming.
         unblock_cli_pipe_input(&pipe_message.name);
 
-        let mut notifications = HashSet::new();
-        notifications.insert(notification_type);
-        self.notification_state.insert(pane_id, notifications);
-
-        // Record which tab this pane belongs to, so we can verify during reorders
-        if let Some(tab_name) = self.find_tab_name_for_pane(pane_id) {
-            #[cfg(debug_assertions)]
-            eprintln!("zellij-attention: Notification for pane {} in tab '{}'", pane_id, tab_name);
-            self.notified_tab_names.insert(pane_id, tab_name);
+        match notification {
+            Some(nt) => self.set_pane_notification(pane_id, nt),
+            None => self.clear_pane_notification(pane_id),
         }
 
         self.update_tab_names();

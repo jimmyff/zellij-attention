@@ -1,10 +1,24 @@
-use serde::{Deserialize, Serialize};
-
-/// Types of notifications a pane can have.
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
+/// Per-pane notification state, ordered by display priority.
+///
+/// A tab showing several Claude panes renders the highest-priority state
+/// (see [`NotificationType::priority`]).
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub enum NotificationType {
-    /// Command is still running
-    Waiting,
-    /// Command has completed
-    Completed,
+    /// Needs the user (highest): `Notification` / `PermissionRequest` hooks.
+    Attention,
+    /// Claude is actively working: `UserPromptSubmit` / `PreToolUse` hooks.
+    Working,
+    /// Claude finished — a completion flag that focus clears: `Stop` hook.
+    Done,
+}
+
+impl NotificationType {
+    /// Higher wins when a tab has several Claude panes: attention > working > done.
+    pub fn priority(&self) -> u8 {
+        match self {
+            NotificationType::Attention => 3,
+            NotificationType::Working => 2,
+            NotificationType::Done => 1,
+        }
+    }
 }
